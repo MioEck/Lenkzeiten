@@ -2,26 +2,24 @@ import express from 'express';
 import Anthropic from '@anthropic-ai/sdk';
 import https from 'https';
 import http from 'http';
+import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 
 const router = express.Router();
 
 const FILE_ID = '1krPQwQ-SR-U-YFuNuQM2FKEJPfYQlUQf';
 
-// PDF wird einmal beim Start geladen und gecacht
-let pdfBase64 = null;
+let pdfText = null;
 let pdfLoaded = false;
 
-function downloadFile(url) {
+function downloadFile(url, redirectCount = 0) {
   return new Promise((resolve, reject) => {
+    if (redirectCount > 5) return reject(new Error('Zu viele Redirects'));
     const protocol = url.startsWith('https') ? https : http;
-    protocol.get(url, (res) => {
+    protocol.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        // Redirect folgen
-        return downloadFile(res.headers.location).then(resolve).catch(reject);
+        return downloadFile(res.headers.location, redirectCount + 1).then(resolve).catch(reject);
       }
-      if (res.statusCode !== 200) {
-        return reject(new Error(`HTTP ${res.statusCode}`));
-      }
+      if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => resolve(Buffer.concat(chunks)));
@@ -36,9 +34,11 @@ export async function loadPDF() {
     console.log('PDF wird von Google Drive geladen...');
     const url = `https://drive.google.com/uc?export=download&id=${FILE_ID}&confirm=t`;
     const buffer = await downloadFile(url);
-    pdfBase64 = buffer.toString('base64');
+    console.log(`PDF heruntergeladen: ${(buffer.length / 1024 / 1024).toFixed(1)} MB — Text wird extrahiert...`);
+    const data = await pdfParse(buffer);
+    pdfText = data.text;
     pdfLoaded = true;
-    console.log(`PDF geladen: ${(buffer.length / 1024 / 1024).toFixed(1)} MB`);
+    console.log(`PDF-Text extrahiert: ${pdfText.length} Zeichen (~${Math.round(pdfText.length / 4)} Tokens)`);
   } catch (err) {
     console.error('PDF konnte nicht geladen werden:', err.message);
   }
@@ -46,15 +46,14 @@ export async function loadPDF() {
 
 const SYSTEM_PROMPT = `Du bist ein rechtssicherer Experte für Lenk- und Ruhezeiten im Straßenverkehr.
 
-Dir liegt das vollständige Fachbuch "Lenk- und Ruhezeiten im Straßenverkehr" von Götz Bopp und Frank Faßbender (Verlag Heinrich Vogel, 2022) als Dokument vor.
+Dir liegt der vollständige Textinhalt des Fachbuchs "Lenk- und Ruhezeiten im Straßenverkehr" von Götz Bopp und Frank Faßbender (Verlag Heinrich Vogel, 2022) vor.
 
-WICHTIGE REGELN FÜR DEINE ANTWORTEN:
-1. Beantworte Fragen AUSSCHLIESSLICH auf Basis des beigefügten Buchinhalts
-2. Zitiere immer die relevante EU-Verordnung (z.B. Art. 4 VO (EG) 561/2006) oder die Buchseite
-3. Bei Unsicherheit: Schreibe explizit "Bitte prüfe dies mit einem Fachexperten oder direkt in der Verordnung"
-4. Erfinde NIEMALS Regeln oder Zahlen — nur was im Buch steht
-5. Antworte immer auf Deutsch
-6. Erkläre verständlich, als ob du einem Berufsfahrer erklärst der die Regeln noch nicht kennt`;
+REGELN FÜR DEINE ANTWORTEN:
+1. Beantworte Fragen AUSSCHLIESSLICH auf Basis des beigefügten Buchtexts
+2. Nenne immer den relevanten Artikel der EU-Verordnung (z.B. Art. 8 VO (EG) 561/2006)
+3. Bei Unsicherheit: Schreibe "Bitte prüfe dies direkt in der Verordnung oder beim Fachexperten"
+4. Erfinde NIEMALS Regeln oder Zahlen
+5. Antworte auf Deutsch, verständlich für Berufsfahrer ohne Vorkenntnisse`;
 
 router.get('/topics', (_req, res) => {
   res.json([
@@ -68,7 +67,7 @@ router.get('/topics', (_req, res) => {
 });
 
 router.get('/pdf-status', (_req, res) => {
-  res.json({ loaded: pdfLoaded });
+  res.json({ loaded: pdfLoaded, chars: pdfText?.length || 0 });
 });
 
 router.post('/chat', async (req, res) => {
@@ -85,61 +84,18 @@ router.post('/chat', async (req, res) => {
 
   const client = new Anthropic({ apiKey });
 
-  // Erste Nachricht enthält das PDF-Dokument
-  let messages;
-  if (pdfBase64 && conversationHistory.length === 0) {
-    // Neues Gespräch: PDF als erstes Dokument mitschicken
-    messages = [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'document',
-            source: {
-              type: 'base64',
-              media_type: 'application/pdf',
-              data: pdfBase64,
-            },
-            title: 'Lenk- und Ruhezeiten im Straßenverkehr (Bopp/Faßbender, 2022)',
-            cache_control: { type: 'ephemeral' },
-          },
-          {
-            type: 'text',
-            text: question,
-          },
-        ],
-      },
-    ];
-  } else if (pdfBase64 && conversationHistory.length > 0) {
-    // Folgenachrichten: History + neue Frage (PDF ist schon im Kontext)
-    messages = [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'document',
-            source: {
-              type: 'base64',
-              media_type: 'application/pdf',
-              data: pdfBase64,
-            },
-            title: 'Lenk- und Ruhezeiten im Straßenverkehr (Bopp/Faßbender, 2022)',
-            cache_control: { type: 'ephemeral' },
-          },
-          {
-            type: 'text',
-            text: conversationHistory.map(m => `${m.role === 'user' ? 'Frage' : 'Antwort'}: ${m.content}`).join('\n\n') + '\n\nNeue Frage: ' + question,
-          },
-        ],
-      },
-    ];
-  } else {
-    // Fallback: Kein PDF verfügbar
-    messages = [
-      ...conversationHistory.map((msg) => ({ role: msg.role, content: msg.content })),
-      { role: 'user', content: question + '\n\n(Hinweis: Das Referenzdokument konnte nicht geladen werden. Bitte wichtige Angaben selbst in der EU-VO 561/2006 prüfen.)' },
-    ];
-  }
+  // Buchtext als Kontext in der ersten Nachricht einbetten
+  const bookContext = pdfText
+    ? `\n\n<buchtext>\n${pdfText}\n</buchtext>\n\nBitte beantworte folgende Frage ausschließlich auf Basis des obigen Buchtexts:`
+    : '\n\n(Hinweis: Das Referenzdokument konnte nicht geladen werden. Bitte wichtige Angaben selbst in der EU-VO 561/2006 prüfen.)\n\nFrage:';
+
+  const messages = conversationHistory.length === 0
+    ? [{ role: 'user', content: bookContext + '\n\n' + question }]
+    : [
+        { role: 'user', content: bookContext + '\n\n' + conversationHistory[0]?.content },
+        ...conversationHistory.slice(1).map(m => ({ role: m.role, content: m.content })),
+        { role: 'user', content: question },
+      ];
 
   try {
     const response = await client.messages.create({
