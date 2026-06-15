@@ -147,7 +147,6 @@ router.post('/chat', async (req, res) => {
       max_tokens: 2048,
       system: SYSTEM_PROMPT,
       messages,
-      betas: pdfBase64 ? ['pdfs-2024-09-25'] : [],
     });
 
     const answer = response.content[0]?.text || 'Keine Antwort erhalten.';
