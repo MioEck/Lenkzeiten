@@ -84,24 +84,28 @@ router.post('/chat', async (req, res) => {
 
   const client = new Anthropic({ apiKey });
 
-  // Buchtext als Kontext in der ersten Nachricht einbetten
-  const bookContext = pdfText
-    ? `\n\n<buchtext>\n${pdfText}\n</buchtext>\n\nBitte beantworte folgende Frage ausschließlich auf Basis des obigen Buchtexts:`
-    : '\n\n(Hinweis: Das Referenzdokument konnte nicht geladen werden. Bitte wichtige Angaben selbst in der EU-VO 561/2006 prüfen.)\n\nFrage:';
+  // System-Prompt: Anweisungen + gecachter Buchtext
+  const systemPrompt = pdfText
+    ? [
+        { type: 'text', text: SYSTEM_PROMPT },
+        {
+          type: 'text',
+          text: `Hier ist der vollständige Inhalt des Fachbuchs als Referenz:\n\n<buchtext>\n${pdfText}\n</buchtext>`,
+          cache_control: { type: 'ephemeral' },
+        },
+      ]
+    : SYSTEM_PROMPT;
 
-  const messages = conversationHistory.length === 0
-    ? [{ role: 'user', content: bookContext + '\n\n' + question }]
-    : [
-        { role: 'user', content: bookContext + '\n\n' + conversationHistory[0]?.content },
-        ...conversationHistory.slice(1).map(m => ({ role: m.role, content: m.content })),
-        { role: 'user', content: question },
-      ];
+  const messages = [
+    ...conversationHistory.map(m => ({ role: m.role, content: m.content })),
+    { role: 'user', content: question },
+  ];
 
   try {
     const response = await client.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 2048,
-      system: SYSTEM_PROMPT,
+      system: systemPrompt,
       messages,
     });
 
